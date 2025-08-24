@@ -1,0 +1,346 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudTrail configuration with S3 logging and Athena analysis setup'
+
+Parameters:
+  CloudTrailName:
+    Type: String
+    Description: 'Name of the CloudTrail'
+    MinLength: 3
+    MaxLength: 128
+    AllowedPattern: '^[a-zA-Z0-9._-]+$'
+    ConstraintDescription: 'CloudTrail name must contain only alphanumeric characters, periods, hyphens, and underscores'
+
+  S3BucketName:
+    Type: String
+    Description: 'Name of the S3 bucket to store CloudTrail logs'
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9.-]+$'
+    ConstraintDescription: 'S3 bucket name must be lowercase letters, numbers, periods, and hyphens'
+
+  # Athena parameters
+  CloudTrailLogsPrefix:
+    Type: String
+    Default: "AWSLogs"
+    Description: Prefix path for CloudTrail logs in S3 bucket
+  
+  TableName:
+    Type: String
+    Default: "table_common_cloudtrail"
+    Description: Name of the Athena table for CloudTrail logs
+  
+  WorkgroupName:
+    Type: String
+    Default: "CommonCloudTrail"
+    Description: Name of the Athena workgroup
+  
+  DatabaseName:
+    Type: String
+    Default: "common_cloudtrail_db"
+    Description: Name of the Glue database for CloudTrail tables
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 2555  # 7 years retention
+            NoncurrentVersionExpirationInDays: 30
+
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: 
+      - S3Bucket
+      - CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Ref CloudTrailName
+      S3BucketName: !Ref S3Bucket
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      IsLogging: true
+      EnableLogFileValidation: true
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources: []
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: S3Bucket
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub 'arn:aws:s3:::${S3Bucket}'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${CloudTrailName}'
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub 'arn:aws:s3:::${S3Bucket}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+                'AWS:SourceArn': !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${CloudTrailName}'
+
+  # Athena Resources
+  # Glue Database
+  CloudTrailDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref DatabaseName
+        Description: Database for CloudTrail logs analysis
+
+  # Athena Workgroup with managed query results location
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Ref WorkgroupName
+      Description: Workgroup for CloudTrail logs analysis
+      State: ENABLED
+      WorkGroupConfiguration:
+        ManagedQueryResultsConfiguration:
+          Enabled: true
+        BytesScannedCutoffPerQuery: 52428800
+        EnforceWorkGroupConfiguration: true
+
+  # CloudTrail table with partition projection
+  CloudTrailTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref CloudTrailDatabase
+      TableInput:
+        Name: !Ref TableName
+        Description: CloudTrail logs table with partition projection
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          projection.enabled: 'true'
+          projection.date.format: 'yyyy/MM/dd'
+          projection.date.interval: '1'
+          projection.date.interval.unit: 'DAYS'
+          projection.date.range: '2020/01/01,NOW'
+          projection.date.type: 'date'
+          projection.region.type: 'enum'
+          projection.region.values: 'us-east-1,us-east-2,us-west-1,us-west-2,eu-west-1,eu-west-2,eu-west-3,eu-central-1,eu-central-2,eu-north-1,eu-south-1,eu-south-2,ap-northeast-1,ap-northeast-2,ap-northeast-3,ap-southeast-1,ap-southeast-2,ap-southeast-3,ap-southeast-4,ap-south-1,ap-south-2,ap-east-1,ca-central-1,sa-east-1,af-south-1,me-south-1,me-central-1,il-central-1'
+          storage.location.template: !Sub 's3://${S3Bucket}/${CloudTrailLogsPrefix}/${AWS::AccountId}/CloudTrail/${!region}/${!date}'
+          classification: 'cloudtrail'
+          compressionType: 'gzip'
+          typeOfData: 'file'
+        StorageDescriptor:
+          Columns:
+            - Name: eventversion
+              Type: string
+            - Name: useridentity
+              Type: struct<type:string,principalid:string,arn:string,accountid:string,invokedby:string,accesskeyid:string,userName:string,sessioncontext:struct<attributes:struct<mfaauthenticated:string,creationdate:string>,sessionissuer:struct<type:string,principalId:string,arn:string,accountId:string,userName:string>>>
+            - Name: eventtime
+              Type: string
+            - Name: eventsource
+              Type: string
+            - Name: eventname
+              Type: string
+            - Name: awsregion
+              Type: string
+            - Name: sourceipaddress
+              Type: string
+            - Name: useragent
+              Type: string
+            - Name: errorcode
+              Type: string
+            - Name: errormessage
+              Type: string
+            - Name: requestparameters
+              Type: string
+            - Name: responseelements
+              Type: string
+            - Name: additionaleventdata
+              Type: string
+            - Name: requestid
+              Type: string
+            - Name: eventid
+              Type: string
+            - Name: resources
+              Type: array<struct<accountid:string,type:string,arn:string>>
+            - Name: eventtype
+              Type: string
+            - Name: apiversion
+              Type: string
+            - Name: readonly
+              Type: string
+            - Name: recipientaccountid
+              Type: string
+            - Name: serviceeventdetails
+              Type: string
+            - Name: sharedeventid
+              Type: string
+            - Name: vpcendpointid
+              Type: string
+          Location: !Sub 's3://${S3Bucket}/${CloudTrailLogsPrefix}/${AWS::AccountId}/CloudTrail/'
+          InputFormat: 'com.amazon.emr.cloudtrail.CloudTrailInputFormat'
+          OutputFormat: 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat'
+          SerdeInfo:
+            SerializationLibrary: 'com.amazon.emr.hive.serde.CloudTrailSerde'
+            Parameters:
+              serialization.format: '1'
+        PartitionKeys:
+          - Name: region
+            Type: string
+          - Name: date
+            Type: string
+
+  # Named Queries for CloudTrail Analysis
+  ErrorEventsQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: "01_ErrorEvents-Today"
+      Description: "Debug query to find error events for today"
+      Database: !Ref CloudTrailDatabase
+      QueryString: !Sub |
+        SELECT 
+          eventtime,
+          eventsource,
+          eventname,
+          errorcode,
+          errormessage,
+          sourceipaddress,
+          useridentity.type as user_type,
+          useridentity.arn as user_arn,
+          region
+        FROM ${DatabaseName}.${TableName}
+        WHERE errorcode IS NOT NULL
+          AND date = date_format(current_date, '%Y/%m/%d')
+          AND region = '${AWS::Region}'
+        ORDER BY eventtime DESC
+        LIMIT 100;
+      WorkGroup: !Ref WorkgroupName
+
+  ConsoleLoginsQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: "02_ConsoleLogins-Today"
+      Description: "AWS Console sign-in events for today"
+      Database: !Ref CloudTrailDatabase
+      QueryString: !Sub |
+        SELECT 
+          eventtime,
+          sourceipaddress,
+          useridentity.type as user_type,
+          useridentity.userName as username,
+          useridentity.arn as user_arn,
+          responseelements,
+          errorcode,
+          errormessage,
+          region
+        FROM ${DatabaseName}.${TableName}
+        WHERE eventname = 'ConsoleLogin'
+          AND date = date_format(current_date, '%Y/%m/%d')
+        ORDER BY eventtime DESC;
+      WorkGroup: !Ref WorkgroupName
+
+  HighVolumeApiCallsQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: "03_HighVolumeAPICalls-LastHour"
+      Description: "Find high-volume API calls in the last hour"
+      Database: !Ref CloudTrailDatabase
+      QueryString: !Sub |
+        SELECT 
+          eventsource,
+          eventname,
+          useridentity.type as user_type,
+          count(*) as call_count,
+          region
+        FROM ${DatabaseName}.${TableName}
+        WHERE eventtime >= date_format(current_timestamp - interval '1' hour, '%Y-%m-%dT%H:%i:%sZ')
+          AND date = date_format(current_date, '%Y/%m/%d')
+        GROUP BY eventsource, eventname, useridentity.type, region
+        HAVING count(*) > 50
+        ORDER BY call_count DESC;
+      WorkGroup: !Ref WorkgroupName
+
+  RootActivityQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: "04_RootActivity-LastWeek"
+      Description: "Monitor root user activity in the last 7 days"
+      Database: !Ref CloudTrailDatabase
+      QueryString: !Sub |
+        SELECT 
+          eventtime,
+          eventsource,
+          eventname,
+          sourceipaddress,
+          useragent,
+          region,
+          requestparameters,
+          responseelements
+        FROM ${DatabaseName}.${TableName}
+        WHERE useridentity.type = 'Root'
+          AND date >= date_format(current_date - interval '7' day, '%Y/%m/%d')
+        ORDER BY eventtime DESC;
+      WorkGroup: !Ref WorkgroupName
+
+Outputs:
+  CloudTrailArn:
+    Description: 'ARN of the created CloudTrail'
+    Value: !GetAtt CloudTrail.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailArn'
+
+  CloudTrailName:
+    Description: 'Name of the created CloudTrail'
+    Value: !Ref CloudTrailName
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudTrailName'
+
+  S3BucketName:
+    Description: 'S3 bucket name used for CloudTrail logs'
+    Value: !Ref S3Bucket
+    Export:
+      Name: !Sub '${AWS::StackName}-S3BucketName'
+
+  # Athena Outputs
+  DatabaseName:
+    Description: Name of the created Glue database
+    Value: !Ref CloudTrailDatabase
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseName'
+  
+  TableName:
+    Description: Name of the created CloudTrail table
+    Value: !Ref TableName
+    Export:
+      Name: !Sub '${AWS::StackName}-TableName'
+  
+  WorkgroupName:
+    Description: Name of the created Athena workgroup
+    Value: !Ref WorkgroupName
+    Export:
+      Name: !Sub '${AWS::StackName}-WorkgroupName'
+  
+  WorkgroupArn:
+    Description: ARN of the created Athena workgroup
+    Value: !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${WorkgroupName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-WorkgroupArn'
