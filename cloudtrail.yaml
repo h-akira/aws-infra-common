@@ -4,6 +4,7 @@ Description: 'CloudTrail configuration with S3 logging and Athena analysis setup
 Parameters:
   CloudTrailName:
     Type: String
+    Default: 'cloudtrail-infra-main'
     Description: 'Name of the CloudTrail'
     MinLength: 3
     MaxLength: 128

@@ -1,0 +1,188 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Lambda function to disable AWS access keys at 3 AM JST daily'
+
+Parameters:
+  LambdaFunctionName:
+    Type: String
+    Default: 'lambda-infra-disable-access-key-001'
+    Description: 'Name of the Lambda function'
+
+  AccessKeyId:
+    Type: String
+    Description: 'AWS Access Key ID to be disabled'
+
+  AccessKeyUserName:
+    Type: String
+    Description: 'IAM User name associated with the access key'
+
+  CloudWatchRuleName:
+    Type: String
+    Default: 'schecule-infra-lambda-infra-disable-access-key-001'
+    Description: 'Name of the CloudWatch Events rule for scheduling'
+
+  IAMRoleName:
+    Type: String
+    Default: 'role-infra-lambda-disable-access-key-001'
+    Description: 'Name of the IAM role for Lambda function'
+
+  CronExpression:
+    Type: String
+    Default: 'cron(0 18 * * ? *)'
+    Description: 'Cron expression for scheduling (default: 3 AM JST daily)'
+
+Resources:
+  # IAM Role for Lambda function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref IAMRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IAMAccessKeyManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:UpdateAccessKey
+                  - iam:ListAccessKeys
+                  - iam:GetAccessKeyLastUsed
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:user/${AccessKeyUserName}'
+
+  # Lambda function
+  DisableKeyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          ACCESS_KEY_ID: !Ref AccessKeyId
+          USER_NAME: !Ref AccessKeyUserName
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import logging
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              # Get environment variables
+              access_key_id = os.environ['ACCESS_KEY_ID']
+              user_name = os.environ['USER_NAME']
+
+              # Initialize IAM client
+              iam_client = boto3.client('iam')
+
+              try:
+                  # Check if access key exists and is active
+                  response = iam_client.list_access_keys(UserName=user_name)
+
+                  access_key_found = False
+                  is_active = False
+
+                  for key_metadata in response['AccessKeyMetadata']:
+                      if key_metadata['AccessKeyId'] == access_key_id:
+                          access_key_found = True
+                          is_active = (key_metadata['Status'] == 'Active')
+                          break
+
+                  if not access_key_found:
+                      logger.warning(f"Access key {access_key_id} not found for user {user_name}")
+                      return {
+                          'statusCode': 404,
+                          'body': json.dumps({
+                              'message': f'Access key {access_key_id} not found',
+                              'timestamp': datetime.now(ZoneInfo('Asia/Tokyo')).isoformat()
+                          })
+                      }
+
+                  if not is_active:
+                      logger.info(f"Access key {access_key_id} is already inactive")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': f'Access key {access_key_id} is already inactive',
+                              'timestamp': datetime.now(ZoneInfo('Asia/Tokyo')).isoformat()
+                          })
+                      }
+
+                  # Disable the access key
+                  iam_client.update_access_key(
+                      UserName=user_name,
+                      AccessKeyId=access_key_id,
+                      Status='Inactive'
+                  )
+
+                  jst_time = datetime.now(ZoneInfo('Asia/Tokyo'))
+                  logger.info(f"Successfully disabled access key {access_key_id} for user {user_name} at {jst_time}")
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': f'Successfully disabled access key {access_key_id}',
+                          'user': user_name,
+                          'timestamp': jst_time.isoformat()
+                      })
+                  }
+
+              except Exception as e:
+                  logger.exception(f"Error disabling access key: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e),
+                          'timestamp': datetime.now(pytz.timezone('Asia/Tokyo')).isoformat()
+                      })
+                  }
+
+  # CloudWatch Events Rule for scheduling (3 AM JST = 6 PM UTC)
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref CloudWatchRuleName
+      Description: 'Trigger Lambda function at 3 AM JST daily'
+      ScheduleExpression: !Ref CronExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DisableKeyLambda.Arn
+          Id: 'DisableKeyLambdaTarget'
+
+  # Permission for CloudWatch Events to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DisableKeyLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+Outputs:
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt DisableKeyLambda.Arn
+
+  ScheduleRuleArn:
+    Description: 'ARN of the CloudWatch Events rule'
+    Value: !GetAtt ScheduleRule.Arn
+
+  IAMRoleArn:
+    Description: 'ARN of the IAM role'
+    Value: !GetAtt LambdaExecutionRole.Arn
