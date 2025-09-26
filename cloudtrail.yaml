@@ -27,17 +27,17 @@ Parameters:
   
   TableName:
     Type: String
-    Default: "table_common_cloudtrail"
+    Default: "table_infra_cloudtrail_main"
     Description: Name of the Athena table for CloudTrail logs
   
   WorkgroupName:
     Type: String
-    Default: "CommonCloudTrail"
+    Default: "InfraCloudTrail"
     Description: Name of the Athena workgroup
   
   DatabaseName:
     Type: String
-    Default: "common_cloudtrail_db"
+    Default: "db_infra_cloudtrail_main"
     Description: Name of the Glue database for CloudTrail tables
 
 Resources:
