@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Lambda function to disable access keys for IAM users with AdministratorAccess policy'
+
+Parameters:
+  LambdaFunctionName:
+    Type: String
+    Default: 'lambda-infra-disable-admin-access-keys'
+    Description: 'Name of the Lambda function'
+
+  CloudWatchRuleName:
+    Type: String
+    Default: 'schedule-infra-disable-admin-access-keys'
+    Description: 'Name of the CloudWatch Events rule for scheduling'
+
+  IAMRoleName:
+    Type: String
+    Default: 'role-infra-lambda-disable-admin-access-keys'
+    Description: 'Name of the IAM role for Lambda function'
+
+  CronExpression:
+    Type: String
+    Default: 'cron(0 18 * * ? *)'
+    Description: 'Cron expression for scheduling (default: 3 AM JST daily = 18:00 UTC)'
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref IAMRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IAMReadAndDisableAccessKeys
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:ListUsers
+                  - iam:ListAttachedUserPolicies
+                  - iam:ListGroupsForUser
+                  - iam:ListAttachedGroupPolicies
+                  - iam:ListAccessKeys
+                  - iam:UpdateAccessKey
+                Resource: '*'
+
+  DisableAdminKeysLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref LambdaFunctionName
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ADMIN_POLICY_ARN = 'arn:aws:iam::aws:policy/AdministratorAccess'
+
+          def has_admin_access(iam, user_name):
+              # Check user's directly attached policies
+              attached = iam.list_attached_user_policies(UserName=user_name)
+              for p in attached['AttachedPolicies']:
+                  if p['PolicyArn'] == ADMIN_POLICY_ARN:
+                      return True
+              # Check policies attached via groups
+              groups = iam.list_groups_for_user(UserName=user_name)
+              for g in groups['Groups']:
+                  gp = iam.list_attached_group_policies(GroupName=g['GroupName'])
+                  for p in gp['AttachedPolicies']:
+                      if p['PolicyArn'] == ADMIN_POLICY_ARN:
+                          return True
+              return False
+
+          def lambda_handler(event, context):
+              iam = boto3.client('iam')
+              results = []
+              paginator = iam.get_paginator('list_users')
+
+              for page in paginator.paginate():
+                  for user in page['Users']:
+                      user_name = user['UserName']
+                      if not has_admin_access(iam, user_name):
+                          continue
+
+                      keys = iam.list_access_keys(UserName=user_name)
+                      for key in keys['AccessKeyMetadata']:
+                          if key['Status'] != 'Active':
+                              continue
+                          iam.update_access_key(
+                              UserName=user_name,
+                              AccessKeyId=key['AccessKeyId'],
+                              Status='Inactive'
+                          )
+                          msg = f"Disabled {key['AccessKeyId']} for {user_name}"
+                          logger.info(msg)
+                          results.append(msg)
+
+              jst_now = datetime.now(ZoneInfo('Asia/Tokyo')).isoformat()
+              body = {'disabled_keys': results, 'timestamp': jst_now}
+              logger.info(json.dumps(body, ensure_ascii=False))
+              return {'statusCode': 200, 'body': json.dumps(body, ensure_ascii=False)}
+
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Ref CloudWatchRuleName
+      Description: 'Trigger Lambda to disable admin access keys on schedule'
+      ScheduleExpression: !Ref CronExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DisableAdminKeysLambda.Arn
+          Id: 'DisableAdminKeysTarget'
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DisableAdminKeysLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+Outputs:
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt DisableAdminKeysLambda.Arn
+
+  ScheduleRuleArn:
+    Description: 'ARN of the CloudWatch Events rule'
+    Value: !GetAtt ScheduleRule.Arn
+
+  IAMRoleArn:
+    Description: 'ARN of the IAM role'
+    Value: !GetAtt LambdaExecutionRole.Arn
